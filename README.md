@@ -8,8 +8,8 @@ Tejashree Venkatesh, Chaitanya Sandeep Jumale, Prasad Chandrashekhar Kanade
 ## Abstract
 We study how well a track's intrinsic audio features explain and predict its
 popularity on Spotify, and whether that relationship holds across genres. Using
-the public Spotify Tracks Dataset (about 114,000 tracks across 125 genres), we
-fit regression, classification, and clustering models, evaluate them against
+the public Spotify Tracks Dataset (about 114,000 rows covering roughly 89,700
+unique tracks across 114 genres), we fit regression, classification, and clustering models, evaluate them against
 naive baselines, and test whether audio to popularity patterns differ by genre.
 
 ## Dataset
