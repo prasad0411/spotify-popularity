@@ -9,17 +9,19 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, LogisticRegression
 from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor,
                                RandomForestClassifier, GradientBoostingClassifier)
 from sklearn.dummy import DummyRegressor, DummyClassifier
 from sklearn.metrics import (
     mean_squared_error, r2_score,
     accuracy_score, f1_score, roc_auc_score,
-    classification_report, RocCurveDisplay,
+    classification_report, confusion_matrix, RocCurveDisplay,
 )
 
 DATA = "data"
@@ -53,7 +55,7 @@ y_reg_train, y_reg_test = y_reg[train_idx], y_reg[test_idx]
 y_clf_train, y_clf_test = y_clf[train_idx], y_clf[test_idx]
 groups_train = groups[train_idx]
 
-# standardize (fit on train only — per Tejashree's note)
+# standardize (fit on train only — per Tejashree's note, no leakage)
 scaler = StandardScaler()
 X_train_s = scaler.fit_transform(X_train)
 X_test_s  = scaler.transform(X_test)
@@ -78,30 +80,43 @@ def cv_reg(name, model):
     print(f"  {name:28s}  CV-RMSE={cv_rmse:.3f}  CV-R2={cv_r2:.4f}  |  Test-RMSE={t_rmse:.3f}  Test-R2={t_r2:.4f}")
     return {"CV_RMSE": cv_rmse, "CV_R2": cv_r2, "Test_RMSE": t_rmse, "Test_R2": t_r2, "pred": pt}
 
-def cv_clf(name, model):
+def cv_clf(name, model, use_sample_weight=False):
+    """Run 5-fold grouped CV for a classifier.
+    use_sample_weight: pass balanced sample weights during fit
+    (needed for GradientBoosting which lacks class_weight param).
+    """
     accs, f1s, aucs = [], [], []
     for tr, va in cv_inner.split(X_train_s, y_clf_train, groups_train):
         m = model.__class__(**model.get_params())
-        m.fit(X_train_s[tr], y_clf_train[tr])
+        if use_sample_weight:
+            sw = compute_sample_weight("balanced", y_clf_train[tr])
+            m.fit(X_train_s[tr], y_clf_train[tr], sample_weight=sw)
+        else:
+            m.fit(X_train_s[tr], y_clf_train[tr])
         p = m.predict(X_train_s[va])
         pr = m.predict_proba(X_train_s[va])[:, 1] if hasattr(m, "predict_proba") else np.zeros(len(p))
         accs.append(accuracy_score(y_clf_train[va], p))
         f1s.append(f1_score(y_clf_train[va], p, zero_division=0))
         aucs.append(roc_auc_score(y_clf_train[va], pr) if pr.any() else 0.5)
-    model.fit(X_train_s, y_clf_train)
+    # final fit on full training set
+    if use_sample_weight:
+        sw_full = compute_sample_weight("balanced", y_clf_train)
+        model.fit(X_train_s, y_clf_train, sample_weight=sw_full)
+    else:
+        model.fit(X_train_s, y_clf_train)
     pt = model.predict(X_test_s)
     prt = model.predict_proba(X_test_s)[:, 1] if hasattr(model, "predict_proba") else np.zeros(len(pt))
     cv_acc, cv_f1, cv_auc = np.mean(accs), np.mean(f1s), np.mean(aucs)
     t_acc = accuracy_score(y_clf_test, pt)
     t_f1  = f1_score(y_clf_test, pt, zero_division=0)
     t_auc = roc_auc_score(y_clf_test, prt) if prt.any() else 0.5
-    print(f"  {name:28s}  CV-AUC={cv_auc:.4f}  CV-F1={cv_f1:.4f}  |  Test-AUC={t_auc:.4f}  Test-F1={t_f1:.4f}")
+    print(f"  {name:28s}  CV-AUC={cv_auc:.4f}  CV-F1={cv_f1:.4f}  |  Test-AUC={t_auc:.4f}  Test-F1={t_f1:.4f}  Test-Acc={t_acc:.4f}")
     return {"CV_Acc": cv_acc, "CV_F1": cv_f1, "CV_AUC": cv_auc,
             "Test_Acc": t_acc, "Test_F1": t_f1, "Test_AUC": t_auc, "pred": pt, "prob": prt}
 
 
 # =====================================================================
-#  REGRESSION
+#  PART A — REGRESSION: predict popularity score
 # =====================================================================
 print("\n" + "="*60)
 print("REGRESSION: predict popularity (continuous)")
@@ -124,32 +139,36 @@ for name, model in reg_specs:
     reg_results[name] = cv_reg(name, model)
     print(f"    ({time.time()-t0:.1f}s)")
 
-# pick best non-baseline
 best_reg_name = max([k for k in reg_results if k != "Mean Baseline"],
                     key=lambda k: reg_results[k]["Test_R2"])
 
+
 # =====================================================================
-#  CLASSIFICATION
+#  PART B — CLASSIFICATION: hit (>= 60) vs non-hit
 # =====================================================================
 print("\n" + "="*60)
 print("CLASSIFICATION: hit (popularity >= 60) vs non-hit")
 print("="*60)
 
+# Note: GradientBoostingClassifier does not accept class_weight,
+# so we pass balanced sample_weight during fit instead.
 clf_specs = [
-    ("Majority Baseline", DummyClassifier(strategy="most_frequent")),
-    ("Random Forest",     RandomForestClassifier(n_estimators=50, max_depth=10,
-                                                 min_samples_leaf=30,
-                                                 class_weight="balanced",
-                                                 random_state=42, n_jobs=-1)),
-    ("Gradient Boosting", GradientBoostingClassifier(n_estimators=100, max_depth=4,
-                                                     learning_rate=0.1,
-                                                     subsample=0.8, random_state=42)),
+    ("Majority Baseline",   DummyClassifier(strategy="most_frequent"), False),
+    ("Logistic Regression", LogisticRegression(class_weight="balanced", max_iter=1000,
+                                               random_state=42), False),
+    ("Random Forest",       RandomForestClassifier(n_estimators=50, max_depth=10,
+                                                   min_samples_leaf=30,
+                                                   class_weight="balanced",
+                                                   random_state=42, n_jobs=-1), False),
+    ("Gradient Boosting",   GradientBoostingClassifier(n_estimators=100, max_depth=4,
+                                                       learning_rate=0.1,
+                                                       subsample=0.8, random_state=42), True),
 ]
 
 clf_results = {}
-for name, model in clf_specs:
+for name, model, sw in clf_specs:
     t0 = time.time()
-    clf_results[name] = cv_clf(name, model)
+    clf_results[name] = cv_clf(name, model, use_sample_weight=sw)
     print(f"    ({time.time()-t0:.1f}s)")
 
 best_clf_name = max([k for k in clf_results if k != "Majority Baseline"],
@@ -160,13 +179,17 @@ print(classification_report(y_clf_test, clf_results[best_clf_name]["pred"],
                             target_names=["Non-hit", "Hit"]))
 
 # refit best models to extract feature importances
-for name, model in reg_specs:
+for name, model, *_ in reg_specs:
     if name == best_reg_name:
         model.fit(X_train_s, y_reg_train)
         best_reg_model = model
-for name, model in clf_specs:
+for name, model, sw in clf_specs:
     if name == best_clf_name:
-        model.fit(X_train_s, y_clf_train)
+        if sw:
+            sw_full = compute_sample_weight("balanced", y_clf_train)
+            model.fit(X_train_s, y_clf_train, sample_weight=sw_full)
+        else:
+            model.fit(X_train_s, y_clf_train)
         best_clf_model = model
 
 
@@ -174,7 +197,7 @@ for name, model in clf_specs:
 #  FIGURES
 # =====================================================================
 
-# Fig 4: Regression comparison
+# ─── Fig 4: Regression comparison ────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 names_r = list(reg_results.keys())
 rmses = [reg_results[n]["Test_RMSE"] for n in names_r]
@@ -193,7 +216,7 @@ plt.savefig(os.path.join(FIG, "fig4_regression_comparison.png"), dpi=150)
 plt.close()
 print("Saved fig4_regression_comparison.png")
 
-# Fig 5: Feature importance (regression)
+# ─── Fig 5: Feature importance (regression) ──────────────────────────
 if hasattr(best_reg_model, "feature_importances_"):
     imp = best_reg_model.feature_importances_; imp_label = "Gini importance"
 elif hasattr(best_reg_model, "coef_"):
@@ -210,7 +233,7 @@ plt.savefig(os.path.join(FIG, "fig5_feature_importance_regression.png"), dpi=150
 plt.close()
 print("Saved fig5_feature_importance_regression.png")
 
-# Fig 6: Feature importance (classifier)
+# ─── Fig 6: Feature importance (classifier) ──────────────────────────
 if hasattr(best_clf_model, "feature_importances_"):
     imp_c = best_clf_model.feature_importances_; imp_c_label = "Gini importance"
 elif hasattr(best_clf_model, "coef_"):
@@ -227,19 +250,23 @@ plt.savefig(os.path.join(FIG, "fig6_feature_importance_classifier.png"), dpi=150
 plt.close()
 print("Saved fig6_feature_importance_classifier.png")
 
-# Fig 7: ROC curve
+# ─── Fig 7: ROC curve (all classifiers) ──────────────────────────────
 fig, ax = plt.subplots(figsize=(6, 6))
-RocCurveDisplay.from_predictions(y_clf_test, clf_results[best_clf_name]["prob"],
-                                 ax=ax, name=best_clf_name)
+for cname in clf_results:
+    if cname == "Majority Baseline":
+        continue
+    RocCurveDisplay.from_predictions(
+        y_clf_test, clf_results[cname]["prob"], ax=ax, name=cname
+    )
 ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, label="Random (AUC=0.50)")
-ax.set_title("ROC curve — hit vs non-hit classifier")
+ax.set_title("ROC curve — hit vs non-hit classifiers")
 ax.legend(loc="lower right")
 plt.tight_layout()
 plt.savefig(os.path.join(FIG, "fig7_roc_curve.png"), dpi=150)
 plt.close()
 print("Saved fig7_roc_curve.png")
 
-# Fig 8: Actual vs predicted scatter
+# ─── Fig 8: Actual vs predicted scatter (regression) ─────────────────
 fig, ax = plt.subplots(figsize=(6, 6))
 ax.scatter(y_reg_test, reg_results[best_reg_name]["pred"], s=3, alpha=0.15, color="steelblue")
 ax.plot([0, 100], [0, 100], "r--", linewidth=1, label="Perfect prediction")
@@ -252,7 +279,22 @@ plt.savefig(os.path.join(FIG, "fig8_actual_vs_predicted.png"), dpi=150)
 plt.close()
 print("Saved fig8_actual_vs_predicted.png")
 
-# ─── Summary ─────────────────────────────────────────────────────────
+# ─── Fig 9: Confusion matrix (best classifier) ──────────────────────
+cm = confusion_matrix(y_clf_test, clf_results[best_clf_name]["pred"])
+fig, ax = plt.subplots(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=["Non-hit", "Hit"],
+            yticklabels=["Non-hit", "Hit"], ax=ax)
+ax.set_xlabel("Predicted label")
+ax.set_ylabel("True label")
+ax.set_title(f"Confusion matrix — {best_clf_name}")
+plt.tight_layout()
+plt.savefig(os.path.join(FIG, "fig9_confusion_matrix.png"), dpi=150)
+plt.close()
+print("Saved fig9_confusion_matrix.png")
+
+
+# ─── Summary tables ──────────────────────────────────────────────────
 print("\n" + "="*60)
 print("SUMMARY TABLES FOR REPORT")
 print("="*60)
